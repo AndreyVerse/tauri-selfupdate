@@ -1,0 +1,13 @@
+{
+  "name": "tauri-selfupdate",
+  "version": "3.1.0",
+  "description": "Release helper for tauri-selfupdate: zips and signs the exe, writes latest.txt, publishes to GitVerse",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "selfupdate-release": "bin/selfupdate-release.mjs"
+  },
+  "files": [
+    "bin"
+  ]
+}
