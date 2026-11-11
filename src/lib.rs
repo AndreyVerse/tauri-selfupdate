@@ -38,9 +38,10 @@ pub enum Source {
     /// теги `<tag_prefix>-v1.2.3`. Токен fine-grained, только чтение содержимого этого
     /// репозитория: он вшит в exe, поэтому из exe его можно достать.
     GitHubPrivate { repo: String, token: String, tag_prefix: String },
-    /// Открытый репозиторий `owner/name` на github.com, без токена: теги `v1.2.3`,
-    /// вложения качаются по `browser_download_url`. Анонимный API — 60 запросов в
-    /// час с одного IP, поэтому приложению не стоит проверять чаще раза в несколько минут.
+    /// Открытый репозиторий `owner/name` на github.com, без токена: теги `v1.2.3`.
+    /// Манифест и архив берутся по ссылкам `releases/latest/download/…` и
+    /// `releases/download/v<версия>/…`, а не через API: анонимный API даёт 60
+    /// запросов в час на IP, и за общим NAT проверка падала бы с 403.
     GitHub { repo: String },
 }
 
@@ -208,25 +209,15 @@ struct GitHubAsset {
     name: String,
     /// Адрес API: у приватного репозитория `browser_download_url` без токена не открывается.
     url: String,
-    /// Публичный адрес вложения: для открытого репозитория без токена и без `Accept`.
-    #[serde(default)]
-    browser_download_url: Option<String>,
 }
 
-/// Релизы открытого репозитория: тег и есть версия, вложения — публичные адреса.
-fn github_public_releases(list: Vec<GitHubRelease>) -> Vec<Release> {
-    list.into_iter()
-        .map(|r| Release {
-            tag_name: r.tag_name,
-            is_draft: r.draft,
-            is_prerelease: r.prerelease,
-            attachments: r
-                .assets
-                .into_iter()
-                .filter_map(|a| Some(Attachment { name: a.name, download_url: a.browser_download_url? }))
-                .collect(),
-        })
-        .collect()
+/// Публичная ссылка на вложение релиза открытого репозитория. `None` — последний
+/// релиз (GitHub сам выбирает последний не-черновик и не-prerelease).
+fn github_public_url(repo: &str, version: Option<&str>, file: &str) -> String {
+    match version {
+        None => format!("https://github.com/{repo}/releases/latest/download/{file}"),
+        Some(version) => format!("https://github.com/{repo}/releases/download/v{version}/{file}"),
+    }
 }
 
 /// Релизы одного приложения из общего репозитория; тег без префикса — версия.
@@ -268,9 +259,6 @@ fn agent(body_timeout: Duration) -> ureq::Agent {
 
 fn get(agent: &ureq::Agent, url: &str, config: &Config) -> Result<ureq::http::Response<ureq::Body>, UpdateError> {
     let mut request = agent.get(url).header("User-Agent", &config.user_agent);
-    if matches!(config.source, Source::GitHub { .. }) && url.starts_with(GITHUB_API) {
-        request = request.header("Accept", "application/vnd.github+json").header("X-GitHub-Api-Version", "2022-11-28");
-    }
     // Токен — только для API GitHub. Вложение отдаётся редиректом на подписанный адрес
     // хранилища, и ureq по умолчанию (`RedirectAuthHeaders::Never`) туда его не передаёт.
     if let Source::GitHubPrivate { token, .. } = &config.source {
@@ -304,16 +292,21 @@ pub fn check(config: &Config, current_version: &str) -> Result<UpdateInfo, Updat
         let manifest: Manifest = read_json(&agent, &url, config)?;
         return info_from(current_version, manifest, None);
     }
+    if let Source::GitHub { repo } = &config.source {
+        let manifest: Manifest = read_json(&agent, &github_public_url(repo, None, MANIFEST_ASSET), config)?;
+        // Архив — по ссылке с версией из манифеста, а не `latest`: новый релиз между
+        // проверкой и установкой подменил бы архив под старой подписью.
+        let version = manifest.version.trim().trim_start_matches('v').to_string();
+        let archive_url = github_public_url(repo, Some(&version), &config.archive_name());
+        return info_from(current_version, manifest, Some(&archive_url));
+    }
     let releases = match &config.source {
         Source::GitVerse { repo } => read_json::<ReleaseList>(&agent, &format!("{GITVERSE_API}/{repo}/releases"), config)?.data,
         Source::GitHubPrivate { repo, tag_prefix, .. } => {
             let list = read_json(&agent, &format!("{GITHUB_API}repos/{repo}/releases?per_page=100"), config)?;
             github_releases(list, tag_prefix)
         }
-        Source::GitHub { repo } => {
-            let list = read_json(&agent, &format!("{GITHUB_API}repos/{repo}/releases?per_page=100"), config)?;
-            github_public_releases(list)
-        }
+        Source::GitHub { .. } => unreachable!("открытый GitHub обработан выше"),
     };
     let release = latest_release(releases)
         .ok_or_else(|| UpdateError::new(ErrorKind::Manifest, format!("{}: no releases", config.repo())))?;
@@ -659,21 +652,9 @@ mod tests {
     }
 
     #[test]
-    fn public_github_releases_use_browser_download_urls() {
-        let list: Vec<GitHubRelease> = serde_json::from_str(
-            r#"[{"tag_name":"v1.1.0","assets":[{"name":"App.zip","url":"https://api.github.com/repos/o/app/releases/assets/1",
-                  "browser_download_url":"https://github.com/o/app/releases/download/v1.1.0/App.zip"}]},
-                {"tag_name":"v1.2.0","assets":[{"name":"App.zip","url":"https://api.github.com/repos/o/app/releases/assets/2",
-                  "browser_download_url":"https://github.com/o/app/releases/download/v1.2.0/App.zip"},
-                 {"name":"latest.txt","url":"https://api.github.com/repos/o/app/releases/assets/3",
-                  "browser_download_url":"https://github.com/o/app/releases/download/v1.2.0/latest.txt"}]},
-                {"tag_name":"v2.0.0-rc.1","prerelease":true,"assets":[]}]"#,
-        )
-        .unwrap();
-        let latest = latest_release(github_public_releases(list)).unwrap();
-        assert_eq!(latest.tag_name, "v1.2.0");
-        assert_eq!(latest.attachment("App.zip"), Some("https://github.com/o/app/releases/download/v1.2.0/App.zip"));
-        assert_eq!(latest.attachment(MANIFEST_ASSET), Some("https://github.com/o/app/releases/download/v1.2.0/latest.txt"));
+    fn public_github_links_bypass_the_api() {
+        assert_eq!(github_public_url("o/app", None, MANIFEST_ASSET), "https://github.com/o/app/releases/latest/download/latest.txt");
+        assert_eq!(github_public_url("o/app", Some("1.2.0"), "App.zip"), "https://github.com/o/app/releases/download/v1.2.0/App.zip");
     }
 
     #[test]
